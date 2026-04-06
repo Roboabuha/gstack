@@ -28,7 +28,14 @@ const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB
 export async function POST(request: NextRequest) {
   let ip = 'unknown';
   try {
-    ip = request.headers.get('x-forwarded-for') || '127.0.0.1';
+    const forwardedFor = request.headers.get('x-forwarded-for');
+    if (forwardedFor) {
+      // 프록시 배열의 가장 마지막(우측) 값이 Traefik이 추가한 클라이언트의 실제 IP입니다.
+      // 공격자가 앞부분을 변조하더라도 마지막 IP를 추출해 방어합니다.
+      ip = forwardedFor.split(',').pop()?.trim() || 'unknown';
+    } else {
+      ip = request.headers.get('x-real-ip') || '127.0.0.1';
+    }
 
     // 0. Rate Limiting (API 비용 폭탄 방어)
     const rateLimit = checkRateLimit(ip);
