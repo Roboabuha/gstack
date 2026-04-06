@@ -19,7 +19,7 @@ interface CropArea {
 }
 
 export interface CropResult {
-  image: string;
+  buffer: Buffer;
   headCropped: boolean;
 }
 
@@ -111,10 +111,15 @@ function calculateCropArea(
   };
 }
 
+export interface CropResult {
+  buffer: Buffer;
+  headCropped: boolean;
+}
+
 /**
- * 이미지 크롭 + 리사이즈 + 압축
+ * 이미지 원본 영역 계산 및 크롭 (압축 제외)
  */
-export async function cropAndResize(
+export async function cropOriginalImage(
   imageBuffer: Buffer,
   face: FaceCoordsType,
   spec: PhotoSpec,
@@ -134,22 +139,13 @@ export async function cropAndResize(
     // 1) 픽셀 스캔으로 실제 머리 꼭대기 찾기
     let hairTopPx = await detectHairTopByPixel(imageBuffer);
     
-    // 픽셀 스캔 결과 검증 (오탐률 보정)
     if (hairTopPx !== null) {
-      if (hairTopPx > geminiFaceTopPx + faceBoxHeight * 0.1) {
-        console.warn(`[crop] Pixel scan hairTop (${hairTopPx}) is too low (glare detected). Fallbacking.`);
-        hairTopPx = null;
-      }
-      else if (hairTopPx < geminiFaceTopPx - faceBoxHeight * 0.8) {
-        console.warn(`[crop] Pixel scan hairTop (${hairTopPx}) is too high (noise/shadow). Fallbacking.`);
-        hairTopPx = null;
-      }
+      if (hairTopPx > geminiFaceTopPx + faceBoxHeight * 0.1) hairTopPx = null;
+      else if (hairTopPx < geminiFaceTopPx - faceBoxHeight * 0.8) hairTopPx = null;
     }
 
     const geometricHairTop = Math.max(0, geminiFaceTopPx - faceBoxHeight * 0.25);
     const actualHairTop = hairTopPx ?? geometricHairTop;
-
-    console.log(`[crop] hairTop: pixel=${hairTopPx}, geminiTop=${Math.round(geminiFaceTopPx)}, using=${Math.round(actualHairTop)}`);
 
     // 2) 크롭 영역 계산 (머리 잘리면 faceRatio 줄여서 재시도)
     let currentSpec = { ...spec };
@@ -162,21 +158,12 @@ export async function cropAndResize(
       headCropped = result.headCropped;
 
       if (!headCropped) break;
-
       currentSpec = { ...currentSpec, faceRatio: currentSpec.faceRatio - 0.05 };
-      console.log(`[crop] Head cropped, retrying with faceRatio=${currentSpec.faceRatio}`);
     }
 
     if (cropArea!.width < 50 || cropArea!.height < 50) return null;
 
-    // --- 아웃바운드 여백(Padding) 추가 로직 ---
-    // 셀카나 여백이 부족한 원본 이미지의 경우 크롭 영역이 이미지 바깥을 벗어날 수 있음.
-    // Sharp extract는 바깥을 벗어나면 에러가 나거나 찌그러지므로, 여백을 흰색으로 확장(extend)한다.
-    let padTop = 0;
-    let padBottom = 0;
-    let padLeft = 0;
-    let padRight = 0;
-
+    let padTop = 0, padBottom = 0, padLeft = 0, padRight = 0;
     if (cropArea!.top < 0) padTop = Math.abs(cropArea!.top);
     if (cropArea!.left < 0) padLeft = Math.abs(cropArea!.left);
     if (cropArea!.top + cropArea!.height > imgHeight) {
@@ -186,7 +173,6 @@ export async function cropAndResize(
       padRight = (cropArea!.left + cropArea!.width) - imgWidth;
     }
 
-    // 패딩이 적용되었을 때, 실제 extract 좌표는 0 이상으로 밀려야 함.
     const extractArea = {
       left: cropArea!.left < 0 ? 0 : cropArea!.left + padLeft,
       top: cropArea!.top < 0 ? 0 : cropArea!.top + padTop,
@@ -194,42 +180,48 @@ export async function cropAndResize(
       height: cropArea!.height,
     };
 
-    console.log('[crop] Calculated pads:', { padTop, padLeft, padBottom, padRight });
-    console.log('[crop] Extract area assigned:', extractArea);
-
     const paddedImage = sharp(imageBuffer).rotate().extend({
-      top: padTop,
-      bottom: padBottom,
-      left: padLeft,
-      right: padRight,
+      top: padTop, bottom: padBottom, left: padLeft, right: padRight,
       background: { r: 255, g: 255, b: 255, alpha: 1 }
     });
 
-    // 3) JPEG 압축
-    let quality = 92;
-    const MIN_QUALITY = 50;
-    let fallbackBuffer: Buffer | null = null;
+    const resultBuffer = await paddedImage.clone()
+      .extract(extractArea)
+      .resize(spec.w, spec.h, { fit: 'fill' })
+      .jpeg({ quality: 100 }) // 최고 화질
+      .toBuffer();
 
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const result = await paddedImage.clone()
-        .extract(extractArea)
-        .resize(spec.w, spec.h, { fit: 'fill' })
-        .jpeg({ quality, mozjpeg: true })
-        .toBuffer();
-
-      fallbackBuffer = result;
-      if (result.byteLength / 1024 <= spec.maxKB) {
-        return { image: result.toString('base64'), headCropped };
-      }
-
-      quality -= 12;
-      if (quality < MIN_QUALITY) break;
-    }
-
-    return { image: fallbackBuffer!.toString('base64'), headCropped };
-
+    return { buffer: resultBuffer, headCropped };
   } catch (err) {
     console.error('[crop] Error:', err);
     return null;
   }
+}
+
+/**
+ * 최종 응답을 위한 JPEG 압축
+ */
+export async function compressImage(
+  imageBuffer: Buffer,
+  spec: PhotoSpec,
+): Promise<string> {
+  let quality = 95;
+  const MIN_QUALITY = 50;
+  let fallbackBuffer: Buffer | null = null;
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const result = await sharp(imageBuffer)
+      .resize(spec.w, spec.h, { fit: 'fill' }) // Gemini 변형 대비 강제 사이즈 고정
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer();
+
+    fallbackBuffer = result;
+    if (result.byteLength / 1024 <= spec.maxKB) {
+      return result.toString('base64');
+    }
+
+    quality -= 12;
+    if (quality < MIN_QUALITY) break;
+  }
+  return fallbackBuffer!.toString('base64');
 }

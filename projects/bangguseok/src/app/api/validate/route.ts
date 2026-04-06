@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { isValidDocumentType, PHOTO_SPECS } from '@/lib/photo-specs';
 import { isValidFaceCoords, type ValidateResponse, type ErrorResponse } from '@/lib/schemas';
 import { validateWithGemini, enhancePhoto, detectFaceCoords, GeminiError } from '@/lib/gemini';
-import { cropAndResize } from '@/lib/crop';
+import { cropOriginalImage, compressImage } from '@/lib/crop';
 import { checkRateLimit } from '@/lib/rate-limit';
 import { getMimeTypeFromMagicNumber } from '@/lib/magic-number';
 
@@ -105,89 +105,62 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================
-    // Step 2: Gemini 이미지 보정 (배경 제거 + 밝기 보정)
+    // Step 2: 원본 이미지에서 안전하게 크롭 먼저 진행
     // ========================================
+    let headCropped = false;
+    let croppedBuffer: Buffer | null = null;
+    let cropFailed = false;
 
-    if (!isValidFaceCoords(geminiResult.face)) {
-      response.enhanceFailed = true;
-      console.log('[validate] Face coords invalid, skipping enhance + crop');
+    console.log('[validate] Step 2: Cropping original image directly...');
+    const spec = PHOTO_SPECS[documentType];
+    const cropResult = await cropOriginalImage(imageBuffer, geminiResult.face, spec);
+
+    if (cropResult) {
+      croppedBuffer = cropResult.buffer;
+      headCropped = cropResult.headCropped;
+      console.log('[validate] Step 2: Crop success, headCropped:', headCropped);
+    } else {
+      cropFailed = true;
+      response.cropFailed = true;
+      console.log('[validate] Step 2: Crop returned null');
+    }
+
+    if (cropFailed || !croppedBuffer) {
       return NextResponse.json(response, { status: 200 });
     }
 
-    let processedBuffer: Buffer | null = null;
+    // ========================================
+    // Step 3: 잘려진 사진의 배경 제거 및 밝기 보정
+    // ========================================
+    let finalBufferToCompress = croppedBuffer;
     let enhanceFailReason: string | undefined;
 
     try {
-      console.log('[validate] Step 2: Calling Gemini enhance...');
-      const enhanceResult = await enhancePhoto(imageBuffer, mimeType);
+      console.log('[validate] Step 3: Calling Gemini enhance on cropped image...');
+      const enhanceResult = await enhancePhoto(croppedBuffer, mimeType);
 
       if (enhanceResult.image) {
-        processedBuffer = enhanceResult.image;
-        console.log('[validate] Step 2: Enhancement success,', processedBuffer.byteLength, 'bytes');
+        finalBufferToCompress = enhanceResult.image;
+        console.log('[validate] Step 3: Enhancement success');
       } else {
         enhanceFailReason = enhanceResult.failReason;
-        console.log('[validate] Step 2: Enhancement failed:', enhanceFailReason);
+        response.enhanceFailed = true;
+        response.enhanceFailReason = enhanceFailReason;
+        console.log('[validate] Step 3: Enhancement failed:', enhanceFailReason);
       }
     } catch (enhanceError) {
-      enhanceFailReason = '일시적인 서버 오류입니다. 잠시 후 다시 시도해주세요.';
-      console.error('[validate] Step 2: Enhancement error (details suppressed for security)');
-    }
-
-    // 보정 실패 → 크롭 스킵, 실패 사유와 함께 반환
-    if (!processedBuffer) {
       response.enhanceFailed = true;
-      response.enhanceFailReason = enhanceFailReason;
-      console.log('[validate] Enhancement failed → returning without crop');
-      return NextResponse.json(response, { status: 200 });
+      console.error('[validate] Step 3: Enhancement error suppressed');
     }
 
     // ========================================
-    // Step 2.5: 보정된 이미지에서 얼굴 좌표 재감지
+    // Step 4: JPEG 압축 (Base64)
     // ========================================
-    let faceForCrop = geminiResult.face; // fallback: 원본 좌표
-    try {
-      console.log('[validate] Step 2.5: Re-detecting face on enhanced image...');
-      const newFace = await detectFaceCoords(processedBuffer, 'image/png');
-      if (newFace && isValidFaceCoords(newFace)) {
-        faceForCrop = newFace;
-        console.log('[validate] Step 2.5: Using enhanced face coords:', newFace);
-      } else {
-        console.log('[validate] Step 2.5: Re-detection failed, using original coords');
-      }
-    } catch {
-      console.log('[validate] Step 2.5: Re-detection error, using original coords');
-    }
+    console.log('[validate] Step 4: Compressing...');
+    response.croppedImage = await compressImage(finalBufferToCompress, spec);
 
     // ========================================
-    // Step 3: Sharp 크롭 + 리사이즈
-    // ========================================
-    let cropSuccess = false;
-    let headCropped = false;
-    try {
-      console.log('[validate] Step 3: Cropping...');
-      const spec = PHOTO_SPECS[documentType];
-      const cropResult = await cropAndResize(
-        processedBuffer,
-        faceForCrop,
-        spec,
-      );
-
-      if (cropResult) {
-        response.croppedImage = cropResult.image;
-        headCropped = cropResult.headCropped;
-        cropSuccess = true;
-        console.log('[validate] Step 3: Crop success, headCropped:', headCropped);
-      } else {
-        response.cropFailed = true;
-        console.log('[validate] Step 3: Crop returned null');
-      }
-    } catch (cropError) {
-      console.error('[validate] Step 3: Crop failed (details suppressed for security)');
-      response.cropFailed = true;
-    }
-
-    // ========================================
-    // Step 4: 최종 검증 결과 업데이트
+    // Step 5: 최종 검증 결과 업데이트
     // ========================================
     // 배경 보정 성공
     response.checks.background_white = {
@@ -199,7 +172,7 @@ export async function POST(request: NextRequest) {
       reason: '✨ AI가 그림자를 제거하고 밝기를 보정했습니다',
     };
 
-    if (cropSuccess) {
+    if (!cropFailed) {
       response.checks.face_ratio = {
         result: 'PASS',
         reason: '✨ 규격에 맞게 얼굴 비율을 자동 조정했습니다 (약 75%)',
