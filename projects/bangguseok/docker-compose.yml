@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  bangguseok-app:
+    build: .
+    container_name: bangguseok-app
+    restart: always
+    ports:
+      - "3777:3000"
+    environment:
+      - NODE_ENV=production
+      # - GEMINI_API_KEY=YOUR_API_KEY_HERE
+    # labels:
+      # 나중에 Traefik HTTPS 연동용 라벨 (도메인 구매 시 주석 해제)
+      # - "traefik.enable=true"
+      # - "traefik.http.routers.bangguseok.rule=Host(`photo.yourdomain.com`)"
+      # - "traefik.http.routers.bangguseok.entrypoints=websecure"
+      # - "traefik.http.routers.bangguseok.tls.certresolver=letsencrypt"
