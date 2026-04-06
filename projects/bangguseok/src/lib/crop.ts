@@ -22,59 +22,10 @@ export interface CropResult {
   buffer: Buffer;
   headCropped: boolean;
 }
-
-/**
- * 흰 배경에서 인물(머리카락) 시작 y좌표를 픽셀 스캔으로 찾기
- *
- * 이미지 상단부터 아래로 스캔하면서, 흰색이 아닌 픽셀이
- * 일정 비율 이상 나타나는 첫 번째 행을 찾는다.
- *
- * @returns 머리카락 시작 y좌표 (px), 찾지 못하면 null
- */
-async function detectHairTopByPixel(imageBuffer: Buffer): Promise<number | null> {
-  try {
-    const { data, info } = await sharp(imageBuffer)
-      .rotate()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    const { width, height, channels } = info;
-
-    // 상단 60%만 스캔 (하단은 어깨/옷이므로 무의미)
-    const scanLimit = Math.floor(height * 0.6);
-
-    for (let y = 0; y < scanLimit; y++) {
-      let nonWhiteCount = 0;
-
-      for (let x = 0; x < width; x++) {
-        const idx = (y * width + x) * channels;
-        const r = data[idx];
-        const g = data[idx + 1];
-        const b = data[idx + 2];
-
-        // 흰색 기준: RGB 모두 240 이상이면 배경
-        if (r < 240 || g < 240 || b < 240) {
-          nonWhiteCount++;
-        }
-      }
-
-      // 해당 행에서 비배경 픽셀이 3% 이상이면 → 인물 시작
-      if (nonWhiteCount / width > 0.03) {
-        console.log(`[crop] Hair top detected at y=${y} (${(y / height * 100).toFixed(1)}%)`);
-        return y;
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * 크롭 영역 계산
  *
- * hairTopPx: 픽셀 스캔으로 찾은 실제 머리 꼭대기
+ * hairTopPx: Gemini가 찾은 실제 머리 꼭대기
  * face.chin: Gemini가 감지한 턱 위치
  */
 function calculateCropArea(
@@ -134,18 +85,10 @@ export async function cropOriginalImage(
 
     const geminiFaceTopPx = face.top * imgHeight;
     const geminiChinPx = face.chin * imgHeight;
-    const faceBoxHeight = geminiChinPx - geminiFaceTopPx;
 
-    // 1) 픽셀 스캔으로 실제 머리 꼭대기 찾기
-    let hairTopPx = await detectHairTopByPixel(imageBuffer);
-    
-    if (hairTopPx !== null) {
-      if (hairTopPx > geminiFaceTopPx + faceBoxHeight * 0.1) hairTopPx = null;
-      else if (hairTopPx < geminiFaceTopPx - faceBoxHeight * 0.8) hairTopPx = null;
-    }
-
-    const geometricHairTop = Math.max(0, geminiFaceTopPx - faceBoxHeight * 0.25);
-    const actualHairTop = hairTopPx ?? geometricHairTop;
+    // AI가 검출한 '머리 꼭대기(머리카락 포함)' 좌표를 100% 신뢰합니다.
+    // 기존의 흰색 배경 픽셀 스캐너는 원본 사진에서는 작동하지 않으므로 제거합니다.
+    const actualHairTop = geminiFaceTopPx;
 
     // 2) 크롭 영역 계산 (머리 잘리면 faceRatio 줄여서 재시도)
     let currentSpec = { ...spec };
