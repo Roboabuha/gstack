@@ -151,6 +151,7 @@ export default function Home() {
   const [result, setResult] = useState<ValidateResponse | null>(null);
   const [error, setError] = useState<string>('');
   const [toast, setToast] = useState<string>('');
+  const [yOffset, setYOffset] = useState<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const showToast = useCallback((msg: string, duration = 3000) => {
@@ -173,6 +174,7 @@ export default function Home() {
       setState('upload');
       setResult(null);
       setError('');
+      setYOffset(0);
     } catch {
       setError('이미지를 읽을 수 없습니다. 다른 사진으로 시도해주세요.');
       setState('error');
@@ -195,14 +197,17 @@ export default function Home() {
     setPreview(null);
     setSelectedFile(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
+    setYOffset(0);
   }, [preview]);
 
-  const handleSubmit = useCallback(async () => {
+  const handleSubmit = useCallback(async (isAdjustment = false) => {
     if (!selectedFile) return;
 
     setState('loading');
     setLoadingStep(0);
     setError('');
+
+    if (!isAdjustment) setYOffset(0);
 
     const stepInterval = setInterval(() => {
       setLoadingStep((prev) => Math.min(prev + 1, LOADING_STEPS.length - 1));
@@ -214,6 +219,9 @@ export default function Home() {
       const formData = new FormData();
       formData.append('file', resized, selectedFile.name);
       formData.append('documentType', docType);
+      if (isAdjustment) {
+        formData.append('yOffsetPercent', yOffset.toString());
+      }
 
       const response = await fetch('/api/validate', {
         method: 'POST',
@@ -236,7 +244,7 @@ export default function Home() {
       setError(err instanceof Error ? err.message : '알 수 없는 오류가 발생했습니다');
       setState('error');
     }
-  }, [selectedFile, docType]);
+  }, [selectedFile, docType, yOffset]);
 
   const handleRetry = useCallback(() => {
     removePreview();
@@ -336,7 +344,7 @@ export default function Home() {
             <button
               id="submit-btn"
               className="btn-cta"
-              onClick={handleSubmit}
+              onClick={() => handleSubmit(false)}
               disabled={!selectedFile}
               type="button"
             >
@@ -498,6 +506,39 @@ export default function Home() {
                     />
                   </div>
                 </div>
+
+                {/* --- 수동 상하 위치 조절 UI --- */}
+                <div style={{ width: '100%', maxWidth: '360px', marginTop: '30px', marginBottom: '12px', padding: '16px', backgroundColor: '#f8f9fa', borderRadius: '12px', boxSizing: 'border-box', border: '1px solid #e9ecef' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                    <span style={{ fontSize: '14px', fontWeight: 600, color: '#333' }}>↕ 위아래 여백 세밀 조정</span>
+                    <span style={{ fontSize: '13px', color: '#666', background: '#e9ecef', padding: '2px 8px', borderRadius: '12px' }}>
+                      {yOffset > 0 ? `상단 좁게 (+${yOffset})` : yOffset < 0 ? `상단 넓게 (${yOffset})` : 'AI 추천 구도'}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-40"
+                    max="40"
+                    step="5"
+                    value={yOffset}
+                    onChange={(e) => setYOffset(Number(e.target.value))}
+                    style={{ width: '100%', cursor: 'pointer', accentColor: 'var(--primary)', height: '6px' }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#888', marginTop: '6px', marginBottom: '20px', padding: '0 4px' }}>
+                    <span>머리 위를 넓게</span>
+                    <span>머리 위를 좁게</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleSubmit(true)}
+                    style={{ width: '100%', padding: '12px', fontSize: '14px', fontWeight: 600, color: '#fff', backgroundColor: '#343a40', border: 'none', borderRadius: '8px', cursor: 'pointer', transition: 'background-color 0.2s', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}
+                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#212529'}
+                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = '#343a40'}
+                  >
+                    현재 위치로 다시 맞추기
+                  </button>
+                </div>
+                {/* ------------------------------ */}
 
                 <button
                   id="download-btn"

@@ -74,6 +74,7 @@ export async function cropOriginalImage(
   imageBuffer: Buffer,
   face: FaceCoordsType,
   spec: PhotoSpec,
+  yOffsetPercent: number = 0
 ): Promise<CropResult | null> {
   try {
     const rotated = sharp(imageBuffer).rotate();
@@ -85,10 +86,11 @@ export async function cropOriginalImage(
 
     const geminiFaceTopPx = face.top * imgHeight;
     const geminiChinPx = face.chin * imgHeight;
+    const faceBoxHeight = geminiChinPx - geminiFaceTopPx;
 
-    // AI가 검출한 '머리 꼭대기(머리카락 포함)' 좌표를 100% 신뢰합니다.
-    // 기존의 흰색 배경 픽셀 스캐너는 원본 사진에서는 작동하지 않으므로 제거합니다.
-    const actualHairTop = geminiFaceTopPx;
+    // 인간이 조절한 막대바 퍼센테이지를 반영
+    const offsetPx = faceBoxHeight * (yOffsetPercent / 100);
+    const actualHairTop = Math.max(0, geminiFaceTopPx + offsetPx);
 
     // 2) 크롭 영역 계산 (머리 잘리면 faceRatio 줄여서 재시도)
     let currentSpec = { ...spec };

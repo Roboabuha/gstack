@@ -107,13 +107,16 @@ export async function POST(request: NextRequest) {
     // ========================================
     // Step 2: 원본 이미지에서 안전하게 크롭 먼저 진행
     // ========================================
+    const yOffsetStr = formData.get('yOffsetPercent') as string | null;
+    const yOffsetPercent = yOffsetStr ? parseInt(yOffsetStr, 10) : 0;
+
     let headCropped = false;
     let croppedBuffer: Buffer | null = null;
     let cropFailed = false;
 
-    console.log('[validate] Step 2: Cropping original image directly...');
+    console.log(`[validate] Step 2: Cropping original image (yOffset: ${yOffsetPercent}%)...`);
     const spec = PHOTO_SPECS[documentType];
-    const cropResult = await cropOriginalImage(imageBuffer, geminiResult.face, spec);
+    const cropResult = await cropOriginalImage(imageBuffer, geminiResult.face, spec, yOffsetPercent);
 
     if (cropResult) {
       croppedBuffer = cropResult.buffer;
