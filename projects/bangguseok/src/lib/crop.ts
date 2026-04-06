@@ -180,12 +180,12 @@ export async function cropOriginalImage(
       height: cropArea!.height,
     };
 
-    const paddedImage = sharp(imageBuffer).rotate().extend({
+    const paddedImageBuffer = await sharp(imageBuffer).rotate().extend({
       top: padTop, bottom: padBottom, left: padLeft, right: padRight,
       background: { r: 255, g: 255, b: 255, alpha: 1 }
-    });
+    }).toBuffer();
 
-    const resultBuffer = await paddedImage.clone()
+    const resultBuffer = await sharp(paddedImageBuffer)
       .extract(extractArea)
       .resize(spec.w, spec.h, { fit: 'fill' })
       .jpeg({ quality: 100 }) // 최고 화질
