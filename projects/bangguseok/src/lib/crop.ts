@@ -31,32 +31,40 @@ export interface CropResult {
 function calculateCropArea(
   imgWidth: number,
   imgHeight: number,
-  hairTopPx: number,
+  actualHairTop: number,
   face: FaceCoordsType,
   spec: PhotoSpec,
 ): { area: CropArea; headCropped: boolean } {
   const faceChinPx = face.chin * imgHeight;
   const faceCenterXPx = face.centerX * imgWidth;
 
-  // 머리 길이 = 머리카락 꼭대기 ~ 턱
-  const faceHeightPx = faceChinPx - hairTopPx;
+  const faceHeightPx = faceChinPx - actualHairTop;
 
-  // 전체 크롭 높이 = 머리 길이 / faceRatio
-  const cropHeight = faceHeightPx / spec.faceRatio;
-  const cropWidth = cropHeight * (spec.w / spec.h);
+  // 1. 표준 크롭 계산 (예: 350x450 기준)
+  const standardCropHeight = faceHeightPx / spec.faceRatio;
+  const standardCropWidth = standardCropHeight * (spec.w / spec.h);
+  
+  const standardTopMargin = standardCropHeight * 0.03;
+  const standardCropTop = actualHairTop - standardTopMargin;
+  const standardCropLeft = faceCenterXPx - standardCropWidth / 2;
 
-  // 머리 위 여백: 사진 전체의 약 3% (4.5cm 기준 약 1.35mm)
-  const topMargin = cropHeight * 0.03;
-  const rawCropTop = hairTopPx - topMargin;
-  const rawCropLeft = faceCenterXPx - cropWidth / 2;
+  // 2. 캔버스용 넉넉한 세로 크롭 확장 (가로는 고정, 세로는 600px 비율로)
+  // 프론트엔드가 350x600 크기를 받아서 350x450 창틀 안에서 움직일 수 있도록 조치
+  const generousWidth = standardCropWidth;
+  const generousHeight = generousWidth * (600 / spec.w); // e.g. 350 : 600
 
-  const headCropped = rawCropTop < 0;
+  const extraHeight = generousHeight - standardCropHeight;
+  // 여유 공간을 위쪽에 40%, 아랫쪽에 60% 배분 (아래쪽 어깨가 더 많이 필요하므로)
+  const generousCropTop = standardCropTop - (extraHeight * 0.4);
+  const generousCropLeft = standardCropLeft;
+
+  const headCropped = generousCropTop < 0; // 이젠 웬만해서 잘리지 않지만 여전히 안전장치
   return {
     area: {
-      left: Math.round(rawCropLeft),
-      top: Math.round(rawCropTop),
-      width: Math.round(cropWidth),
-      height: Math.round(cropHeight),
+      left: Math.round(generousCropLeft),
+      top: Math.round(generousCropTop),
+      width: Math.round(generousWidth),
+      height: Math.round(generousHeight),
     },
     headCropped,
   };
@@ -74,7 +82,6 @@ export async function cropOriginalImage(
   imageBuffer: Buffer,
   face: FaceCoordsType,
   spec: PhotoSpec,
-  yOffsetPercent: number = 0
 ): Promise<CropResult | null> {
   try {
     const rotated = sharp(imageBuffer).rotate();
@@ -86,11 +93,7 @@ export async function cropOriginalImage(
 
     const geminiFaceTopPx = face.top * imgHeight;
     const geminiChinPx = face.chin * imgHeight;
-    const faceBoxHeight = geminiChinPx - geminiFaceTopPx;
-
-    // 인간이 조절한 막대바 퍼센테이지를 반영
-    const offsetPx = faceBoxHeight * (yOffsetPercent / 100);
-    const actualHairTop = Math.max(0, geminiFaceTopPx + offsetPx);
+    const actualHairTop = geminiFaceTopPx;
 
     // 2) 크롭 영역 계산 (머리 잘리면 faceRatio 줄여서 재시도)
     let currentSpec = { ...spec };
@@ -132,7 +135,7 @@ export async function cropOriginalImage(
 
     const resultBuffer = await sharp(paddedImageBuffer)
       .extract(extractArea)
-      .resize(spec.w, spec.h, { fit: 'fill' })
+      .resize(spec.w, 600, { fit: 'fill' }) // 프론트엔드용 Generous Crop 사이즈 고정
       .jpeg({ quality: 100 }) // 최고 화질
       .toBuffer();
 

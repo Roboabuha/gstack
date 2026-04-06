@@ -256,11 +256,47 @@ export default function Home() {
   const handleDownload = useCallback(() => {
     if (!result?.croppedImage) return;
 
-    const link = document.createElement('a');
-    link.href = `data:image/jpeg;base64,${result.croppedImage}`;
-    link.download = `증명사진_${docType}_${Date.now()}.jpg`;
-    link.click();
-  }, [result, docType]);
+    const imgElement = document.getElementById('final-crop-img') as HTMLImageElement | null;
+    if (!imgElement) return;
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = `data:image/jpeg;base64,${result.croppedImage}`;
+    
+    img.onload = () => {
+      // 결과 해상도는 여권 사진 최적화 크기 (350x450)
+      const exportWidth = 350;
+      const exportHeight = 450;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = exportWidth;
+      canvas.height = exportHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      // CSS 픽셀 대 원본 픽셀 스케일 계산
+      const cssWidth = imgElement.offsetWidth;
+      const scale = exportWidth / cssWidth;
+
+      // 백엔드가 준 350x600 이미지에서 자를 위치 계산
+      // 기본 위치: margin-top이 extraHeight의 40% 만큼 내려간 곳 (yOffset=0 일때 sourceY=60)
+      // yOffset이 양수면 아래로(-yOffsetpx 이동) -> mask 영역 위쪽이 보이므로 sourceY는 감소
+      const defaultSourceY = 60; 
+      let sourceYOffset = defaultSourceY - (yOffset * scale);
+      
+      // 범위를 벗어나지 않도록 방어 (0 ~ 150)
+      sourceYOffset = Math.max(0, Math.min(150, sourceYOffset));
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, exportWidth, exportHeight);
+      ctx.drawImage(img, 0, sourceYOffset, exportWidth, exportHeight, 0, 0, exportWidth, exportHeight);
+
+      const link = document.createElement('a');
+      link.href = canvas.toDataURL('image/jpeg', 1.0);
+      link.download = `증명사진_${docType}_${Date.now()}.jpg`;
+      link.click();
+    };
+  }, [result, yOffset, docType]);
 
   const isRejected = result && !result.feasible;
   const isEnhanceFailed = result && result.feasible && result.enhanceFailed;
@@ -491,52 +527,52 @@ export default function Home() {
           <section className="card" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
             {result.croppedImage ? (
               <>
-                <div className="comparison">
-                  <div className="comparison__item">
+                <div className="comparison" style={{ gap: '32px' }}>
+                  <div className="comparison__item" style={{ flex: 1, maxWidth: '200px' }}>
                     <span className="comparison__label">원본 사진</span>
-                    {preview && <img src={preview} alt="원본" className="comparison__img" />}
+                    {preview && <img src={preview} alt="원본" className="comparison__img" style={{ borderRadius: '12px' }} />}
                   </div>
-                  <span className="comparison__arrow">→</span>
-                  <div className="comparison__item">
-                    <span className="comparison__label">규격 완성본</span>
-                    <img
-                      src={`data:image/jpeg;base64,${result.croppedImage}`}
-                      alt="보정된 증명사진"
-                      className="comparison__img comparison__img--after"
-                    />
+                  <div className="comparison__item" style={{ flex: 1, maxWidth: '200px' }}>
+                    <span className="comparison__label">규격 완성본 (3.5x4.5 비율)</span>
+                    <div style={{ width: '100%', aspectRatio: '3.5 / 4.5', overflow: 'hidden', position: 'relative', borderRadius: '12px', border: '2px solid var(--primary)' }}>
+                      <img
+                        id="final-crop-img"
+                        src={`data:image/jpeg;base64,${result.croppedImage}`}
+                        alt="보정된 증명사진"
+                        style={{
+                          width: '100%',
+                          height: 'auto',
+                          display: 'block',
+                          position: 'absolute',
+                          transform: `translateY(calc(-10% + ${yOffset}px))`,
+                          willChange: 'transform'
+                        }}
+                      />
+                    </div>
                   </div>
                 </div>
 
-                {/* --- 수동 상하 위치 조절 UI --- */}
+                {/* --- 실시간 수동 상하 위치 조절 UI --- */}
                 <div style={{ width: '100%', maxWidth: '360px', marginTop: '30px', marginBottom: '12px', padding: '16px', backgroundColor: '#f8f9fa', borderRadius: '12px', boxSizing: 'border-box', border: '1px solid #e9ecef' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                    <span style={{ fontSize: '14px', fontWeight: 600, color: '#333' }}>↕ 위아래 여백 세밀 조정</span>
+                    <span style={{ fontSize: '14px', fontWeight: 600, color: '#333' }}>↕ 머리 위 여백 세밀 조정</span>
                     <span style={{ fontSize: '13px', color: '#666', background: '#e9ecef', padding: '2px 8px', borderRadius: '12px' }}>
-                      {yOffset > 0 ? `상단 좁게 (+${yOffset})` : yOffset < 0 ? `상단 넓게 (${yOffset})` : 'AI 추천 구도'}
+                      {yOffset > 0 ? `머리 위 좁게` : yOffset < 0 ? `머리 위 넓게` : 'AI 추천 구도'}
                     </span>
                   </div>
                   <input
                     type="range"
-                    min="-40"
-                    max="40"
-                    step="5"
+                    min="-60"
+                    max="60"
+                    step="1"
                     value={yOffset}
                     onChange={(e) => setYOffset(Number(e.target.value))}
                     style={{ width: '100%', cursor: 'pointer', accentColor: 'var(--primary)', height: '6px' }}
                   />
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#888', marginTop: '6px', marginBottom: '20px', padding: '0 4px' }}>
-                    <span>머리 위를 넓게</span>
-                    <span>머리 위를 좁게</span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#888', marginTop: '6px', padding: '0 4px' }}>
+                    <span>여백 넓게 (사진 내림)</span>
+                    <span>여백 없게 (사진 올림)</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleSubmit(true)}
-                    style={{ width: '100%', padding: '12px', fontSize: '14px', fontWeight: 600, color: '#fff', backgroundColor: '#343a40', border: 'none', borderRadius: '8px', cursor: 'pointer', transition: 'background-color 0.2s', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}
-                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#212529'}
-                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = '#343a40'}
-                  >
-                    현재 위치로 다시 맞추기
-                  </button>
                 </div>
                 {/* ------------------------------ */}
 
@@ -544,9 +580,10 @@ export default function Home() {
                   id="download-btn"
                   className="btn-download"
                   onClick={handleDownload}
+                  style={{ width: '100%', maxWidth: '360px', marginTop: '8px' }}
                   type="button"
                 >
-                  규격 사진 다운로드
+                  최종 규격 사진 다운로드
                 </button>
               </>
             ) : (

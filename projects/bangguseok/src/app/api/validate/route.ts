@@ -105,18 +105,15 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================
-    // Step 2: 원본 이미지에서 안전하게 크롭 먼저 진행
+    // Step 2: 원본 이미지에서 넉넉하게 크롭(Generous Crop) 먼저 진행
     // ========================================
-    const yOffsetStr = formData.get('yOffsetPercent') as string | null;
-    const yOffsetPercent = yOffsetStr ? parseInt(yOffsetStr, 10) : 0;
-
     let headCropped = false;
     let croppedBuffer: Buffer | null = null;
     let cropFailed = false;
 
-    console.log(`[validate] Step 2: Cropping original image (yOffset: ${yOffsetPercent}%)...`);
+    console.log(`[validate] Step 2: Cropping generous original image...`);
     const spec = PHOTO_SPECS[documentType];
-    const cropResult = await cropOriginalImage(imageBuffer, geminiResult.face, spec, yOffsetPercent);
+    const cropResult = await cropOriginalImage(imageBuffer, geminiResult.face, spec);
 
     if (cropResult) {
       croppedBuffer = cropResult.buffer;
