@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import type { ValidateResponse } from '@/lib/schemas';
 import type { DocumentType } from '@/lib/photo-specs';
 
@@ -139,6 +139,15 @@ function ShieldCheckIcon() {
 type AppState = 'upload' | 'loading' | 'result' | 'error';
 
 /* ===================================
+   뷰포트 상수 (413:531 비율)
+   =================================== */
+
+const VIEWPORT_W = 310;
+const VIEWPORT_H = Math.round(VIEWPORT_W * (531 / 413)); // 399
+const OUTPUT_W = 413;
+const OUTPUT_H = 531;
+
+/* ===================================
    메인 컴포넌트
    =================================== */
 
@@ -152,6 +161,25 @@ export default function Home() {
   const [error, setError] = useState<string>('');
   const [toast, setToast] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Adjust 상태 (위치/줌) ──
+  const [adjustImgSrc, setAdjustImgSrc] = useState<string>(''); // enhanced image data URL
+  const [adjustImgW, setAdjustImgW] = useState(0);
+  const [adjustImgH, setAdjustImgH] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [panX, setPanX] = useState(0); // 0~1 비율
+  const [panY, setPanY] = useState(0);
+  const [defaultZoom, setDefaultZoom] = useState(1);
+  const [defaultPanX, setDefaultPanX] = useState(0);
+  const [defaultPanY, setDefaultPanY] = useState(0);
+
+  // ── 색상 조정 상태 ──
+  const [brightness, setBrightness] = useState(100); // 70~130 (%)
+  const [saturation, setSaturation] = useState(100); // 50~150 (%)
+  const [contrast, setContrast] = useState(100);     // 70~130 (%)
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+  const dragStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
 
   const showToast = useCallback((msg: string, duration = 3000) => {
     setToast(msg);
@@ -229,6 +257,60 @@ export default function Home() {
 
       const data: ValidateResponse = await response.json();
       setResult(data);
+
+      // enhanced 이미지가 있으면 수동 조정 준비
+      if (data.feasible && data.enhancedImage && data.imageWidth && data.imageHeight) {
+        const src = `data:image/jpeg;base64,${data.enhancedImage}`;
+        setAdjustImgSrc(src);
+        setAdjustImgW(data.imageWidth);
+        setAdjustImgH(data.imageHeight);
+
+        // 기본 줌 베이스 설정 (가장 줄였을 때 뷰포트에 꽉 차는 최소 배율)
+        const fitZoom = Math.max(VIEWPORT_W / data.imageWidth, VIEWPORT_H / data.imageHeight);
+        let initZoom = fitZoom * 1.1;
+        let initPanX = 0.5;
+        let initPanY = 0.3;
+
+        // AI가 크롭한 영역(cropArea)이 제공되면 이를 바탕으로 슬라이더의 시작 상태를 완전히 동기화합니다.
+        if (data.cropArea) {
+          const cropW = data.cropArea.width;
+          const cropTop = data.cropArea.top;
+          const cropLeft = data.cropArea.left;
+          
+          initZoom = VIEWPORT_W / cropW;
+          
+          const scaledW = data.imageWidth * initZoom;
+          const scaledH = data.imageHeight * initZoom;
+          
+          const MAX_PAD_X = VIEWPORT_W * 0.5;
+          const MAX_PAD_Y = VIEWPORT_H * 0.5;
+          
+          const txMax = MAX_PAD_X;
+          const txMin = -(scaledW - VIEWPORT_W + MAX_PAD_X);
+          const tyMax = MAX_PAD_Y;
+          const tyMin = -(scaledH - VIEWPORT_H + MAX_PAD_Y);
+          
+          const tx = -cropLeft * initZoom;
+          const ty = -cropTop * initZoom;
+          
+          initPanX = (txMax - txMin) === 0 ? 0 : (txMax - tx) / (txMax - txMin);
+          initPanY = (tyMax - tyMin) === 0 ? 0 : (tyMax - ty) / (tyMax - tyMin);
+          
+          initPanX = Math.max(0, Math.min(1, initPanX));
+          initPanY = Math.max(0, Math.min(1, initPanY));
+        }
+
+        setZoom(initZoom);
+        setDefaultZoom(initZoom); // 슬라이더 범위를 현재 줌 기준으로 세팅
+        setPanX(initPanX);
+        setPanY(initPanY);
+        setDefaultPanX(initPanX);
+        setDefaultPanY(initPanY);
+      }
+      // 색상 조정 초기화
+      setBrightness(100);
+      setSaturation(100);
+      setContrast(100);
       setState('result');
 
     } catch (err) {
@@ -245,14 +327,108 @@ export default function Home() {
     setState('upload');
   }, [removePreview]);
 
-  const handleDownload = useCallback(() => {
-    if (!result?.croppedImage) return;
+  /* ===================================
+     Adjust: 줌/패닝으로 실제 이미지 transform 계산
+     =================================== */
 
-    const link = document.createElement('a');
-    link.href = `data:image/jpeg;base64,${result.croppedImage}`;
-    link.download = `증명사진_${docType}_${Date.now()}.jpg`;
-    link.click();
-  }, [result, docType]);
+  const getTransform = useCallback(() => {
+    const scaledW = adjustImgW * zoom;
+    const scaledH = adjustImgH * zoom;
+    
+    // 허용할 최대 여백 (뷰포트의 절반 크기까지 흰 배경 노출 허용)
+    const MAX_PAD_X = VIEWPORT_W * 0.5;
+    const MAX_PAD_Y = VIEWPORT_H * 0.5;
+
+    const txMax = MAX_PAD_X;
+    const txMin = -(scaledW - VIEWPORT_W + MAX_PAD_X);
+    const tyMax = MAX_PAD_Y;
+    const tyMin = -(scaledH - VIEWPORT_H + MAX_PAD_Y);
+
+    const tx = txMax - panX * (txMax - txMin);
+    const ty = tyMax - panY * (tyMax - tyMin);
+
+    return { tx, ty, scaledW, scaledH, txMax, txMin, tyMax, tyMin };
+  }, [adjustImgW, adjustImgH, zoom, panX, panY]);
+
+  // 드래그로 이동
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    isDragging.current = true;
+    dragStart.current = { x: e.clientX, y: e.clientY, panX, panY };
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }, [panX, panY]);
+
+  const handlePointerMove = useCallback((e: React.PointerEvent) => {
+    if (!isDragging.current) return;
+    const dx = e.clientX - dragStart.current.x;
+    const dy = e.clientY - dragStart.current.y;
+    const { txMax, txMin, tyMax, tyMin } = getTransform();
+
+    const rangeX = txMax - txMin;
+    if (rangeX > 0) {
+      const newPanX = dragStart.current.panX - dx / rangeX;
+      setPanX(Math.max(0, Math.min(1, newPanX)));
+    }
+    
+    const rangeY = tyMax - tyMin;
+    if (rangeY > 0) {
+      const newPanY = dragStart.current.panY - dy / rangeY;
+      setPanY(Math.max(0, Math.min(1, newPanY)));
+    }
+  }, [getTransform]);
+
+  const handlePointerUp = useCallback(() => {
+    isDragging.current = false;
+  }, []);
+
+  const handleDownload = useCallback(() => {
+    if (!adjustImgSrc) return;
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = OUTPUT_W;
+      canvas.height = OUTPUT_H;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      // 1. 흰색 배경
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, OUTPUT_W, OUTPUT_H);
+
+      // 2. Canvas filter 적용 (CSS filter와 동일한 문법 → WYSIWYG 보장)
+      ctx.filter = `brightness(${brightness}%) saturate(${saturation}%) contrast(${contrast}%)`;
+
+      // 3. 뷰포트→캔버스 좌표 매핑
+      const { tx, ty, scaledW, scaledH } = getTransform();
+      const scaleX = OUTPUT_W / VIEWPORT_W;
+      const scaleY = OUTPUT_H / VIEWPORT_H;
+      ctx.drawImage(img, tx * scaleX, ty * scaleY, scaledW * scaleX, scaledH * scaleY);
+
+      // 4. 다운로드
+      const link = document.createElement('a');
+      link.href = canvas.toDataURL('image/jpeg', 0.95);
+      link.download = `증명사진_${docType}_${Date.now()}.jpg`;
+      link.click();
+    };
+
+    img.onerror = () => {
+      console.error('Download image load failed');
+    };
+
+    img.src = adjustImgSrc;
+  }, [adjustImgSrc, docType, brightness, saturation, contrast, getTransform]);
+
+  // 전체 초기화 (위치 + 색상)
+  const handleReset = useCallback(() => {
+    setZoom(defaultZoom);
+    setPanX(defaultPanX);
+    setPanY(defaultPanY);
+    setBrightness(100);
+    setSaturation(100);
+    setContrast(100);
+  }, [defaultZoom, defaultPanX, defaultPanY]);
 
   const isRejected = result && !result.feasible;
   const isEnhanceFailed = result && result.feasible && result.enhanceFailed;
@@ -417,6 +593,8 @@ export default function Home() {
         </div>
       )}
 
+
+
       {/* ═══ Result — 변환 불가 ═══ */}
       {isRejected && (
         <div className="results container">
@@ -453,12 +631,12 @@ export default function Home() {
       {isEnhanceFailed && (
         <div className="results container">
           <div className="result-banner result-banner--warn" style={{ fontFamily: 'var(--font-body)', fontWeight: 500, fontSize: 16 }}>
-            일시적인 서버 오류로 이미지 보정에 실패했습니다.
+            얼굴을 명확히 인식하지 못했어요. 밝고 그림자 없는 곳에서 다시 촬영해 주세요.
           </div>
 
           <section className="card">
             <div className="rejection-reason">
-              <p>{result.enhanceFailReason || 'AI 이미지 편집 노드에서 응답을 받지 못했습니다.'}</p>
+              <p>{result.enhanceFailReason || 'AI가 얼굴의 주요 이목구비를 찾는 데 실패했습니다.'}</p>
             </div>
           </section>
 
@@ -473,44 +651,119 @@ export default function Home() {
       {/* ═══ Result — 변환 성공 ═══ */}
       {hasResult && (
         <div className="results container">
-          <div className="result-banner">
+          <div className={`result-banner ${result.overall === 'PASS' ? 'result-banner--pass' : 'result-banner--warn'}`}>
             {result.overall === 'PASS'
               ? '모든 규격을 완벽히 충족하는 증명사진입니다.'
               : '일부 규격에 미달되나, AI가 최적의 상태로 보정했습니다.'}
           </div>
 
-          {/* Download & Comparison */}
-          <section className="card" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-            {result.croppedImage ? (
+          {/* ═══ WYSIWYG 에디터 ═══ */}
+          <section className="card editor-card">
+            {adjustImgSrc ? (
               <>
-                <div className="comparison">
-                  <div className="comparison__item">
-                    <span className="comparison__label">원본 사진</span>
-                    {preview && <img src={preview} alt="원본" className="comparison__img" />}
-                  </div>
-                  <span className="comparison__arrow">→</span>
-                  <div className="comparison__item">
-                    <span className="comparison__label">규격 완성본</span>
+                <p className="editor-hint">드래그로 위치 이동 · 슬라이더로 보정</p>
+
+                {/* 뷰포트 */}
+                <div className="adjust-workspace">
+                  <div
+                    ref={viewportRef}
+                    className="adjust-viewport"
+                    onPointerDown={handlePointerDown}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerLeave={handlePointerUp}
+                  >
                     <img
-                      src={`data:image/jpeg;base64,${result.croppedImage}`}
-                      alt="보정된 증명사진"
-                      className="comparison__img comparison__img--after"
+                      src={adjustImgSrc}
+                      alt="증명사진 미리보기"
+                      className="adjust-viewport__image"
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        transformOrigin: '0 0',
+                        width: `${adjustImgW}px`,
+                        height: `${adjustImgH}px`,
+                        transform: `translate(${getTransform().tx}px, ${getTransform().ty}px) scale(${zoom})`,
+                        filter: `brightness(${brightness}%) saturate(${saturation}%) contrast(${contrast}%)`,
+                      }}
+                      draggable={false}
                     />
+                    <div className="adjust-viewport__guide" />
+                    <div className="adjust-viewport__center-line" />
                   </div>
                 </div>
 
-                <button
-                  id="download-btn"
-                  className="btn-download"
-                  onClick={handleDownload}
-                  type="button"
-                >
-                  규격 사진 다운로드
-                </button>
+                {/* 슬라이더 4개 */}
+                <div className="adjust-controls-stack">
+                  <div className="adjust-control-row">
+                    <span className="adjust-control-label">확대</span>
+                    <input
+                      type="range"
+                      min="50"
+                      max="150"
+                      value={Math.round(zoom * 100)}
+                      onChange={(e) => setZoom(Number(e.target.value) / 100)}
+                      aria-label="확대/축소"
+                    />
+                    <span className="adjust-control-val">{Math.round(zoom * 100)}%</span>
+                  </div>
+                  <div className="adjust-control-row">
+                    <span className="adjust-control-label">명도</span>
+                    <input
+                      type="range"
+                      min="70"
+                      max="130"
+                      value={brightness}
+                      onChange={(e) => setBrightness(Number(e.target.value))}
+                      aria-label="명도"
+                    />
+                    <span className="adjust-control-val">{brightness}%</span>
+                  </div>
+                  <div className="adjust-control-row">
+                    <span className="adjust-control-label">채도</span>
+                    <input
+                      type="range"
+                      min="50"
+                      max="150"
+                      value={saturation}
+                      onChange={(e) => setSaturation(Number(e.target.value))}
+                      aria-label="채도"
+                    />
+                    <span className="adjust-control-val">{saturation}%</span>
+                  </div>
+                  <div className="adjust-control-row">
+                    <span className="adjust-control-label">대비</span>
+                    <input
+                      type="range"
+                      min="70"
+                      max="130"
+                      value={contrast}
+                      onChange={(e) => setContrast(Number(e.target.value))}
+                      aria-label="대비"
+                    />
+                    <span className="adjust-control-val">{contrast}%</span>
+                  </div>
+                </div>
+
+                {/* 다운로드 + 초기화 */}
+                <div className="editor-actions">
+                  <button
+                    id="download-btn"
+                    className="btn-download"
+                    onClick={handleDownload}
+                    type="button"
+                  >
+                    규격 사진 다운로드
+                  </button>
+                  <button className="btn-reset-link" onClick={handleReset} type="button">
+                    초기화
+                  </button>
+                </div>
               </>
             ) : (
               <div style={{ color: 'var(--warning)', fontSize: 14 }}>
-                에러: 이미지 크롭 처리를 완수할 수 없습니다. 다시 시도해주세요.
+                에러: 이미지 보정 처리를 완수할 수 없습니다. 다시 시도해주세요.
               </div>
             )}
           </section>

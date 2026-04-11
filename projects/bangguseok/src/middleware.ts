@@ -33,7 +33,9 @@ export function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+  // Traefik/nginx는 마지막에 실제 클라이언트 IP를 추가하므로 .pop() 사용
+  // (첫 번째 값은 공격자가 변조 가능)
+  const ip = request.headers.get('x-forwarded-for')?.split(',').pop()?.trim()
     || request.headers.get('x-real-ip')
     || '127.0.0.1';
 

@@ -18,6 +18,12 @@ const CheckItem = z.object({
 export const FaceCoords = z.object({
   /** 정수리 y좌표 (0-1) */
   top: z.number().min(0).max(1),
+  /** 눈(Eye) y좌표 (0-1) */
+  eyeY: z.number().min(0).max(1),
+  /** 코끝(Nose) y좌표 (0-1) */
+  noseY: z.number().min(0).max(1),
+  /** 입(Mouth) y좌표 (0-1) */
+  mouthY: z.number().min(0).max(1),
   /** 턱 y좌표 (0-1) */
   chin: z.number().min(0).max(1),
   /** 얼굴 중심 x좌표 (0-1) */
@@ -73,9 +79,18 @@ export interface ValidateResponse {
   feasible: boolean;
   rejectionReason?: string;      // 변환 불가 사유
   croppedImage?: string;         // base64 JPEG (규격 크롭 완료)
+  enhancedImage?: string;        // base64 JPEG (배경 제거된 전체 이미지 — 위치 조정용)
+  imageWidth?: number;           // 보정 이미지 원본 너비 (px)
+  imageHeight?: number;          // 보정 이미지 원본 높이 (px)
   cropFailed?: boolean;          // 크롭 실패 시 true
   enhanceFailed?: boolean;       // 이미지 보정 실패 시 true
   enhanceFailReason?: string;    // 보정 실패 구체적 사유
+  cropArea?: {                   // AI 자동 크롭 역산 좌표 및 크기
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
   error?: string;
 }
 

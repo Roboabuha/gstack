@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isValidDocumentType, PHOTO_SPECS } from '@/lib/photo-specs';
 import { isValidFaceCoords, type ValidateResponse, type ErrorResponse } from '@/lib/schemas';
-import { validateWithGemini, enhancePhoto, detectFaceCoords, GeminiError } from '@/lib/gemini';
-import { cropOriginalImage, compressImage } from '@/lib/crop';
-import { checkRateLimit } from '@/lib/rate-limit';
+import { validateWithGemini, enhancePhoto, GeminiError } from '@/lib/gemini';
+import { cropOriginalImage, compressImage, detectHairTopByPixelScan } from '@/lib/crop';
+// Rate limiting은 middleware.ts에서 통합 처리 (10req/min)
 import { getMimeTypeFromMagicNumber } from '@/lib/magic-number';
 
 /**
@@ -37,12 +37,7 @@ export async function POST(request: NextRequest) {
       ip = request.headers.get('x-real-ip') || '127.0.0.1';
     }
 
-    // 0. Rate Limiting (API 비용 폭탄 방어)
-    const rateLimit = checkRateLimit(ip);
-    if (!rateLimit.success) {
-      console.warn(`[Security] Rate limit exceeded for IP: ${ip}`);
-      return errorResponse('요청이 너무 많습니다. 잠시 후 다시 시도해주세요.', 429);
-    }
+    // Rate limiting은 middleware.ts에서 통합 처리됨 (이중 적용 제거)
 
     // 1. FormData 파싱
     let formData: FormData;
@@ -85,10 +80,26 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================
+    // Step 0.5: EXIF 회전 정규화 (★ 근본 원인 수정)
+    // ========================================
+    // 스마트폰 사진은 EXIF orientation 태그로 회전 정보를 저장하지만,
+    // Gemini API는 raw 픽셀 기준으로 좌표를 반환하고,
+    // crop.ts의 sharp는 .rotate()로 자동 회전을 적용합니다.
+    // → 두 좌표계가 달라져서 크롭이 엉뚱한 위치를 자르는 근본 원인이었습니다.
+    // 해결: 파이프라인 최초 진입 시 EXIF 회전을 픽셀에 적용(bake)하여
+    //       이후 모든 단계가 동일한 좌표계를 사용하도록 합니다.
+    const sharp = (await import('sharp')).default;
+    const normalizedBuffer = await sharp(imageBuffer).rotate().toBuffer();
+    const normalizedMeta = await sharp(normalizedBuffer).metadata();
+    console.log(`[validate] EXIF normalized: ${normalizedMeta.width}x${normalizedMeta.height}`);
+
+    // ========================================
     // Step 1: Gemini 검증 (8항목 + 좌표 + 실현가능성)
     // ========================================
     console.log('[validate] Step 1: Calling Gemini validate with', file.name, file.size, 'bytes');
-    const geminiResult = await validateWithGemini(imageBuffer, realMimeType);
+
+    // ★ normalizedBuffer를 Gemini에 전송 (EXIF 회전 적용된 상태)
+    const geminiResult = await validateWithGemini(normalizedBuffer, 'image/jpeg');
     console.log('[validate] Step 1 result:', geminiResult.overall, 'feasible:', geminiResult.feasible);
 
     const response: ValidateResponse = {
@@ -105,24 +116,76 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================
-    // Step 2: 원본 이미지에서 안전하게 크롭 먼저 진행
+    // Step 2: 배경 제거 + 밝기 보정 (★ 크롭보다 먼저!)
+    // ========================================
+    // 순서 변경 이유: 배경을 먼저 흰색으로 만들면
+    // Step 3에서 픽셀 스캔으로 머리끝을 정확히 찾을 수 있음
+    let enhancedBuffer = normalizedBuffer;
+    let enhanceFailReason: string | undefined;
+
+    try {
+      console.log('[validate] Step 2: Enhancing FULL image (bg removal)...');
+      const enhanceResult = await enhancePhoto(normalizedBuffer, 'image/jpeg');
+
+      if (enhanceResult.image) {
+        enhancedBuffer = enhanceResult.image;
+        console.log('[validate] Step 2: Enhancement success ✅');
+      } else {
+        enhanceFailReason = enhanceResult.failReason;
+        response.enhanceFailed = true;
+        response.enhanceFailReason = enhanceFailReason;
+        console.log('[validate] Step 2: Enhancement failed:', enhanceFailReason);
+        // 실패해도 원본으로 계속 진행 (Gemini 좌표 fallback)
+      }
+    } catch (enhanceError) {
+      response.enhanceFailed = true;
+      console.error('[validate] Step 2: Enhancement error suppressed');
+    }
+
+    // ========================================
+    // Step 3: 픽셀 스캔으로 머리끝 정확 감지 (흰 배경 필요)
+    // ========================================
+    let pixelHairTop: number | null = null;
+
+    if (enhancedBuffer !== normalizedBuffer) {
+      // 배경 제거 성공 → 흰 배경 위에서 픽셀 스캔
+      console.log('[validate] Step 3: Pixel scanning for hair top on white-bg image...');
+      pixelHairTop = await detectHairTopByPixelScan(enhancedBuffer, geminiResult.face.centerX);
+      
+      if (pixelHairTop !== null) {
+        console.log(`[validate] Step 3: Hair top at y=${pixelHairTop}px ✅`);
+      } else {
+        console.log('[validate] Step 3: Pixel scan failed, falling back to Gemini coords');
+      }
+    } else {
+      console.log('[validate] Step 3: Skipped (no white bg available)');
+    }
+
+    // ========================================
+    // Step 4: 규격 크롭 (픽셀 스캔 우선, Gemini fallback)
     // ========================================
     let headCropped = false;
     let croppedBuffer: Buffer | null = null;
     let cropFailed = false;
 
-    console.log('[validate] Step 2: Cropping original image directly...');
+    console.log('[validate] Step 4: Cropping image...');
     const spec = PHOTO_SPECS[documentType];
-    const cropResult = await cropOriginalImage(imageBuffer, geminiResult.face, spec);
+    // ★ 배경 제거된 이미지를 크롭 + 픽셀 스캔 hairTop 전달
+    const cropResult = await cropOriginalImage(
+      enhancedBuffer,
+      geminiResult.face,
+      spec,
+      pixelHairTop ?? undefined,
+    );
 
     if (cropResult) {
       croppedBuffer = cropResult.buffer;
       headCropped = cropResult.headCropped;
-      console.log('[validate] Step 2: Crop success, headCropped:', headCropped);
+      console.log('[validate] Step 4: Crop success, headCropped:', headCropped);
     } else {
       cropFailed = true;
       response.cropFailed = true;
-      console.log('[validate] Step 2: Crop returned null');
+      console.log('[validate] Step 4: Crop returned null');
     }
 
     if (cropFailed || !croppedBuffer) {
@@ -130,37 +193,29 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================
-    // Step 3: 잘려진 사진의 배경 제거 및 밝기 보정
+    // Step 5: 보정 이미지 전체 반환 (위치 조정 UI용)
     // ========================================
-    let finalBufferToCompress = croppedBuffer;
-    let enhanceFailReason: string | undefined;
-
-    try {
-      console.log('[validate] Step 3: Calling Gemini enhance on cropped image...');
-      const enhanceResult = await enhancePhoto(croppedBuffer, mimeType);
-
-      if (enhanceResult.image) {
-        finalBufferToCompress = enhanceResult.image;
-        console.log('[validate] Step 3: Enhancement success');
-      } else {
-        enhanceFailReason = enhanceResult.failReason;
-        response.enhanceFailed = true;
-        response.enhanceFailReason = enhanceFailReason;
-        console.log('[validate] Step 3: Enhancement failed:', enhanceFailReason);
-      }
-    } catch (enhanceError) {
-      response.enhanceFailed = true;
-      console.error('[validate] Step 3: Enhancement error suppressed');
+    const enhancedMeta = await sharp(enhancedBuffer).metadata();
+    // 보정 이미지를 JPEG로 압축 후 base64 전달
+    const enhancedJpeg = await sharp(enhancedBuffer)
+      .jpeg({ quality: 92 })
+      .toBuffer();
+    response.enhancedImage = enhancedJpeg.toString('base64');
+    response.imageWidth = enhancedMeta.width || 0;
+    response.imageHeight = enhancedMeta.height || 0;
+    if (cropResult) {
+      response.cropArea = cropResult.area;
     }
+    console.log(`[validate] Step 5: Enhanced image ${enhancedMeta.width}x${enhancedMeta.height} → ${(enhancedJpeg.byteLength / 1024).toFixed(0)}KB`);
 
     // ========================================
-    // Step 4: JPEG 압축 (Base64)
+    // Step 6: AI 자동 크롭 (추천 위치용, 선택적)
     // ========================================
-    console.log('[validate] Step 4: Compressing...');
-    response.croppedImage = await compressImage(finalBufferToCompress, spec);
+    console.log('[validate] Step 6: Compressing cropped image...');
+    response.croppedImage = await compressImage(croppedBuffer, spec);
 
     // ========================================
-    // Step 5: 최종 검증 결과 업데이트
+    // Step 7: 최종 검증 결과 업데이트
     // ========================================
     // 배경 보정 성공
     response.checks.background_white = {
@@ -206,8 +261,8 @@ export async function POST(request: NextRequest) {
       return errorResponse(error.message, error.statusCode);
     }
 
-    console.error(`[Security] Unexpected error in /api/validate (IP: ${ip})`);
-    return errorResponse('서비스 오류가 발생했습니다. 잠시 후 다시 시도해주세요', 500);
+    console.error(`[Security] Unexpected error in /api/validate (IP: ${ip})`, error);
+    return errorResponse('얼굴을 찾을 수 없어요. 다시 한번 밝은 곳에서 인물을 명확히 찍어보세요.', 500);
   }
 }
 
